@@ -1,6 +1,6 @@
-import os, json, re, random, string, hashlib, asyncio, threading
+﻿import os, json, re, random, string, hashlib, asyncio, threading
 import html as _html
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 
 import telebot
@@ -34,6 +34,120 @@ def norm(s: str) -> str:
 def sha(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+MSK_TZ = timezone(timedelta(hours=3))
+
+def now_msk() -> datetime:
+    return datetime.now(MSK_TZ)
+
+def dt_from_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def fmt_dt_msk(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "-"
+    return dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M МСК")
+
+def parse_date_token(s: str) -> Optional[datetime.date]:
+    t = (s or "").strip().lower()
+    if t in ("сегодня", "today"):
+        return now_msk().date()
+    if t in ("завтра", "tomorrow"):
+        return (now_msk() + timedelta(days=1)).date()
+    m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", t)
+    if not m:
+        return None
+    d, mo, y = map(int, m.groups())
+    try:
+        return datetime(y, mo, d).date()
+    except Exception:
+        return None
+
+def parse_time_token(s: str) -> Optional[Tuple[int, int]]:
+    m = re.match(r"^(\d{1,2}):(\d{2})$", (s or "").strip())
+    if not m:
+        return None
+    hh, mm = map(int, m.groups())
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return hh, mm
+
+def combine_date_time(d: datetime.date, hm: Tuple[int, int]) -> datetime:
+    hh, mm = hm
+    return datetime(d.year, d.month, d.day, hh, mm, tzinfo=MSK_TZ)
+
+def assignment_window_status(a: Dict[str, Any], now: datetime) -> Tuple[str, Optional[datetime], Optional[datetime]]:
+    open_at = dt_from_iso(a.get("open_at"))
+    due_at = dt_from_iso(a.get("due_at"))
+    if open_at and now < open_at:
+        return "not_open", open_at, due_at
+    if due_at and now > due_at:
+        return "closed", open_at, due_at
+    return "open", open_at, due_at
+
+def assignment_status_label(a: Dict[str, Any], now: datetime) -> str:
+    status, open_at, due_at = assignment_window_status(a, now)
+    if status == "not_open":
+        return f"⏳ с {fmt_dt_msk(open_at)}"
+    if status == "closed":
+        return f"⌛ до {fmt_dt_msk(due_at)}"
+    if due_at:
+        return f"до {fmt_dt_msk(due_at)}"
+    return "без дедлайна"
+
+def assignment_can_submit(a: Dict[str, Any], now: datetime) -> Tuple[bool, str]:
+    status, open_at, due_at = assignment_window_status(a, now)
+    if status == "not_open":
+        return False, f"Задание доступно с {fmt_dt_msk(open_at)}."
+    if status == "closed":
+        return False, f"Срок сдачи истёк ({fmt_dt_msk(due_at)})."
+    return True, ""
+
+def find_invite(data: Dict[str, Any], code: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    for cid, c in data.get("classes", {}).items():
+        if not isinstance(c, dict):
+            continue
+        invs = c.get("invites", {})
+        if not isinstance(invs, dict):
+            continue
+        inv = invs.get(code)
+        if isinstance(inv, dict):
+            return cid, inv
+    return None, None
+
+def invite_valid(inv: Dict[str, Any], now: datetime) -> Tuple[bool, str]:
+    exp = dt_from_iso(inv.get("expires_at"))
+    if exp and now > exp:
+        return False, "Инвайт истёк."
+    max_uses = int(inv.get("max_uses", 1))
+    uses = int(inv.get("uses", 0))
+    if uses >= max_uses:
+        return False, "Инвайт уже использован."
+    return True, ""
+
+def format_ok(text: str, regex: Optional[str]) -> bool:
+    if not regex:
+        return True
+    try:
+        return re.fullmatch(regex, (text or "").strip()) is not None
+    except re.error:
+        return True
+
+def get_class_students(data: Dict[str, Any], class_id: str) -> List[Tuple[str, Dict[str, Any]]]:
+    return [(sid, u) for sid, u in data.get("users", {}).items()
+            if isinstance(u, dict) and u.get("role") == "student" and u.get("class_id") == class_id]
+
+def has_result(data: Dict[str, Any], assignment_id: str, student_id: str) -> bool:
+    for r in data.get("results", {}).values():
+        if not isinstance(r, dict):
+            continue
+        if r.get("assignment_id") == assignment_id and r.get("student_id") == student_id:
+            return True
+    return False
 
 def send_code_block(chat_id: int, code: str, reply_markup=None) -> None:
     """Send code safely using Telegram HTML <pre><code> to avoid Markdown entity errors."""
@@ -155,7 +269,7 @@ Nonce для уникальности: {nonce}
 
 def ensure(data: Any) -> Dict[str, Any]:
     if not isinstance(data, dict): data = {}
-    for k in ["users","classes","tests","ctf_tasks","assignments","results"]:
+    for k in ["users","classes","tests","ctf_tasks","homeworks","assignments","results"]:
         data.setdefault(k, {})
     data.setdefault("ctf_fingerprints", [])
     # migrate old tests with class_id into assignments
@@ -194,6 +308,7 @@ def run_async(coro):
 
 def kb_teacher():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add("🔐 Инвайт в класс","🔒 Приватность класса")
     kb.add("✅ Создать класс","🧑‍🏫 Ваши классы")
     kb.add("🧪 Создать задание","📚 Ваши тесты")
     kb.add("🏁 Ваши CTF","📊 Результаты")
@@ -477,9 +592,28 @@ def reg(m):
         bot.send_message(m.chat.id,"✅ Вы учитель.", reply_markup=kb_teacher()); return
     if st["step"]=="class_code":
         data=load_data()
+        now = now_msk()
+        cid, inv = find_invite(data, t)
+        if cid and inv:
+            ok, msg = invite_valid(inv, now)
+            if not ok:
+                bot.reply_to(m, msg)
+                return
+            inv["uses"] = int(inv.get("uses", 0)) + 1
+            inv.setdefault("used_by", []).append(uid)
+            inv["last_used_at"] = now_iso()
+            data["users"][uid]["class_id"] = cid
+            save_data(data)
+            user_states.pop(uid,None)
+            bot.send_message(m.chat.id,"✅ Вы в классе по инвайту.", reply_markup=kb_student()); return
         cid=None
         for k,v in data["classes"].items():
-            if isinstance(v,dict) and v.get("access_code")==t: cid=k; break
+            if isinstance(v,dict) and v.get("access_code")==t:
+                if v.get("private"):
+                    bot.reply_to(m,"Класс приватный. Нужен инвайт.")
+                    return
+                cid=k
+                break
         if not cid: bot.reply_to(m,"Класс не найден. Попробуйте снова."); return
         data["users"][uid]["class_id"]=cid; save_data(data)
         user_states.pop(uid,None)
@@ -519,6 +653,168 @@ def t_classes(m):
         studs=[u for u in data["users"].values() if isinstance(u,dict) and u.get("role")=="student" and u.get("class_id")==c.get("id")]
         out.append(f"• {c.get('name')} — код {c.get('access_code')} — учеников {len(studs)}")
     bot.send_message(m.chat.id,"\n".join(out), reply_markup=kb_teacher())
+
+# --------------- TEACHER: CLASS INVITES / PRIVACY ---------------
+
+@bot.message_handler(func=lambda m: m.text=="🔐 Инвайт в класс")
+def t_class_invite(m):
+    data=load_data(); uid=str(m.from_user.id)
+    if data["users"].get(uid,{}).get("role")!="teacher":
+        bot.reply_to(m,"Только учителю.")
+        return
+    cls=[c for c in data["classes"].values() if isinstance(c,dict) and c.get("teacher_id")==uid]
+    if not cls:
+        bot.send_message(m.chat.id,"Классов нет.", reply_markup=kb_teacher())
+        return
+    kb=types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for c in cls:
+        kb.add(f"Класс: {c['name']}")
+    kb.add("❌ Отмена")
+    user_states[uid]={"flow":"class_invite","step":"class"}
+    bot.send_message(m.chat.id,"Выберите класс:", reply_markup=kb)
+
+@bot.message_handler(func=lambda m: user_states.get(str(m.from_user.id),{}).get("flow")=="class_invite")
+def t_class_invite_flow(m):
+    uid=str(m.from_user.id); st=user_states[uid]
+    if m.text=="❌ Отмена":
+        user_states.pop(uid,None); bot.send_message(m.chat.id,"Ок.", reply_markup=kb_teacher()); return
+    t=(m.text or "").strip()
+    data=load_data()
+    if st["step"]=="class":
+        if not t.startswith("Класс: "):
+            bot.reply_to(m,"Кнопкой.")
+            return
+        name=t.replace("Класс: ","",1).strip()
+        cid=None
+        for k,v in data["classes"].items():
+            if isinstance(v,dict) and v.get("teacher_id")==uid and v.get("name")==name:
+                cid=k
+                break
+        if not cid:
+            bot.reply_to(m,"Класс не найден.")
+            return
+        st["cid"]=cid; st["step"]="exp_date"
+        bot.send_message(m.chat.id,"Дата окончания инвайта (ДД.ММ.ГГГГ или 'сегодня/завтра'):", reply_markup=kb_cancel())
+        return
+    if st["step"]=="exp_date":
+        if t=="❌ Отмена":
+            user_states.pop(uid,None); bot.send_message(m.chat.id,"Ок.", reply_markup=kb_teacher()); return
+        d=parse_date_token(t)
+        if not d:
+            bot.reply_to(m,"Нужна дата: ДД.ММ.ГГГГ или 'сегодня/завтра'.")
+            return
+        st["exp_date"]=d; st["step"]="exp_time"
+        bot.send_message(m.chat.id,"Время (ЧЧ:ММ, МСК):", reply_markup=kb_cancel())
+        return
+    if st["step"]=="exp_time":
+        if t=="❌ Отмена":
+            user_states.pop(uid,None); bot.send_message(m.chat.id,"Ок.", reply_markup=kb_teacher()); return
+        hm=parse_time_token(t)
+        if not hm:
+            bot.reply_to(m,"Время в формате ЧЧ:ММ.")
+            return
+        exp_dt=combine_date_time(st["exp_date"], hm)
+        if exp_dt <= now_msk():
+            bot.reply_to(m,"Время уже прошло. Укажите будущее.")
+            return
+        st["exp_dt"]=exp_dt; st["step"]="max_uses"
+        bot.send_message(m.chat.id,"Сколько использований? (1-100, по умолчанию 1):", reply_markup=kb_cancel())
+        return
+    if st["step"]=="max_uses":
+        if t=="❌ Отмена":
+            user_states.pop(uid,None); bot.send_message(m.chat.id,"Ок.", reply_markup=kb_teacher()); return
+        max_uses = 1
+        if t and t.isdigit():
+            max_uses = int(t)
+        if max_uses < 1 or max_uses > 100:
+            bot.reply_to(m,"1-100.")
+            return
+        cid=st["cid"]
+        c=data["classes"].get(cid)
+        if not c:
+            user_states.pop(uid,None); bot.send_message(m.chat.id,"Класс не найден.", reply_markup=kb_teacher()); return
+        c.setdefault("invites", {})
+        code="".join(random.choices(string.ascii_uppercase+string.digits, k=8))
+        while code in c["invites"]:
+            code="".join(random.choices(string.ascii_uppercase+string.digits, k=8))
+        c["invites"][code]={
+            "code": code,
+            "expires_at": st["exp_dt"].isoformat(),
+            "max_uses": max_uses,
+            "uses": 0,
+            "created_at": now_iso()
+        }
+        save_data(data)
+        user_states.pop(uid,None)
+        bot.send_message(
+            m.chat.id,
+            f"✅ Инвайт создан:\nКод: <code>{code}</code>\nДействует до: {fmt_dt_msk(st['exp_dt'])}",
+            parse_mode="HTML",
+            reply_markup=kb_teacher()
+        )
+        return
+
+@bot.message_handler(func=lambda m: m.text=="🔒 Приватность класса")
+def t_class_privacy(m):
+    data=load_data(); uid=str(m.from_user.id)
+    if data["users"].get(uid,{}).get("role")!="teacher":
+        bot.reply_to(m,"Только учителю.")
+        return
+    cls=[c for c in data["classes"].values() if isinstance(c,dict) and c.get("teacher_id")==uid]
+    if not cls:
+        bot.send_message(m.chat.id,"Классов нет.", reply_markup=kb_teacher())
+        return
+    kb=types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for c in cls:
+        kb.add(f"Класс: {c['name']}")
+    kb.add("❌ Отмена")
+    user_states[uid]={"flow":"class_privacy","step":"class"}
+    bot.send_message(m.chat.id,"Выберите класс:", reply_markup=kb)
+
+@bot.message_handler(func=lambda m: user_states.get(str(m.from_user.id),{}).get("flow")=="class_privacy")
+def t_class_privacy_flow(m):
+    uid=str(m.from_user.id); st=user_states[uid]
+    if m.text=="❌ Отмена":
+        user_states.pop(uid,None); bot.send_message(m.chat.id,"Ок.", reply_markup=kb_teacher()); return
+    t=(m.text or "").strip()
+    data=load_data()
+    if st["step"]=="class":
+        if not t.startswith("Класс: "):
+            bot.reply_to(m,"Кнопкой.")
+            return
+        name=t.replace("Класс: ","",1).strip()
+        cid=None
+        for k,v in data["classes"].items():
+            if isinstance(v,dict) and v.get("teacher_id")==uid and v.get("name")==name:
+                cid=k
+                break
+        if not cid:
+            bot.reply_to(m,"Класс не найден.")
+            return
+        st["cid"]=cid; st["step"]="toggle"
+        c=data["classes"][cid]
+        status="приватный" if c.get("private") else "публичный"
+        kb=types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        kb.add("🔒 Включить", "🔓 Выключить")
+        kb.add("❌ Отмена")
+        bot.send_message(m.chat.id,f"Статус: {status}. Изменить?", reply_markup=kb)
+        return
+    if st["step"]=="toggle":
+        cid=st["cid"]
+        c=data["classes"].get(cid)
+        if not c:
+            user_states.pop(uid,None); bot.send_message(m.chat.id,"Класс не найден.", reply_markup=kb_teacher()); return
+        if t=="🔒 Включить":
+            c["private"]=True
+        elif t=="🔓 Выключить":
+            c["private"]=False
+        else:
+            bot.reply_to(m,"Кнопкой.")
+            return
+        save_data(data)
+        user_states.pop(uid,None)
+        bot.send_message(m.chat.id,"✅ Обновлено.", reply_markup=kb_teacher())
+        return
 
 # --------------- TEACHER: CREATE TASK ---------------
 
@@ -583,6 +879,117 @@ async def finalize_test(teacher_id: str, topic: str, n: int, diff: str, chat_id:
     mk.add(types.InlineKeyboardButton("📌 Назначить в класс", callback_data=f"assign_test:{tid}"),
            types.InlineKeyboardButton("Позже", callback_data="assign_later"))
     bot.send_message(chat_id,f"✅ Тест создан: {topic}\nID: {tid}\nВопросов: {len(qs)}", reply_markup=mk)
+
+# --------------- TEACHER: HOMEWORK CREATE ---------------
+
+@bot.message_handler(func=lambda m: user_states.get(str(m.from_user.id),{}).get("flow")=="hw_create")
+def t_hw_create(m):
+    uid=str(m.from_user.id); st=user_states[uid]
+    if m.text=="❌ Отмена":
+        user_states.pop(uid,None); bot.send_message(m.chat.id,"Отменено.", reply_markup=kb_teacher()); return
+    t=(m.text or "").strip()
+    if st["step"]=="title":
+        if len(t) < 3:
+            bot.reply_to(m,"Коротко. Ещё раз.")
+            return
+        st["title"]=t; st["step"]="text"
+        bot.send_message(m.chat.id,"Текст задания/инструкция:", reply_markup=kb_cancel()); return
+    if st["step"]=="text":
+        if len(t) < 3:
+            bot.reply_to(m,"Добавьте описание.")
+            return
+        st["text"]=t; st["step"]="format"
+        bot.send_message(m.chat.id,"Формат ответа (regex) или '-' чтобы без проверки:", reply_markup=kb_cancel()); return
+    if st["step"]=="format":
+        st["format_regex"]=None if t=="-" else t
+        st["step"]="open_date"
+        bot.send_message(m.chat.id,"Когда открыть? (сейчас или дата ДД.ММ.ГГГГ):", reply_markup=kb_cancel()); return
+    if st["step"]=="open_date":
+        if t.lower()=="сейчас":
+            st["open_at"]=None
+            st["step"]="due_date"
+            bot.send_message(m.chat.id,"Дедлайн: дата ДД.ММ.ГГГГ или '-' без дедлайна:", reply_markup=kb_cancel()); return
+        d=parse_date_token(t)
+        if not d:
+            bot.reply_to(m,"Нужна дата: ДД.ММ.ГГГГ или 'сегодня/завтра', либо 'сейчас'.")
+            return
+        st["open_date"]=d; st["step"]="open_time"
+        bot.send_message(m.chat.id,"Время открытия (ЧЧ:ММ, МСК):", reply_markup=kb_cancel()); return
+    if st["step"]=="open_time":
+        hm=parse_time_token(t)
+        if not hm:
+            bot.reply_to(m,"Время в формате ЧЧ:ММ.")
+            return
+        open_at=combine_date_time(st["open_date"], hm)
+        if open_at <= now_msk():
+            bot.reply_to(m,"Время уже прошло. Укажите будущее.")
+            return
+        st["open_at"]=open_at
+        st["step"]="due_date"
+        bot.send_message(m.chat.id,"Дедлайн: дата ДД.ММ.ГГГГ или '-' без дедлайна:", reply_markup=kb_cancel()); return
+    if st["step"]=="due_date":
+        if t=="-":
+            st["due_at"]=None
+        else:
+            d=parse_date_token(t)
+            if not d:
+                bot.reply_to(m,"Нужна дата: ДД.ММ.ГГГГ или '-'.")
+                return
+            st["due_date"]=d; st["step"]="due_time"
+            bot.send_message(m.chat.id,"Время дедлайна (ЧЧ:ММ, МСК):", reply_markup=kb_cancel()); return
+        # create homework
+        data=load_data()
+        hid=gen_id("H")
+        data["homeworks"][hid]={
+            "id":hid,
+            "teacher_id":uid,
+            "title":st["title"],
+            "text":st["text"],
+            "format_regex":st.get("format_regex"),
+            "open_at": st["open_at"].isoformat() if st.get("open_at") else None,
+            "due_at": st.get("due_at").isoformat() if st.get("due_at") else None,
+            "created_at": now_iso()
+        }
+        save_data(data)
+        user_states.pop(uid,None)
+        mk=types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("📌 Назначить в класс", callback_data=f"assign_hw:{hid}"),
+               types.InlineKeyboardButton("Позже", callback_data="assign_later"))
+        bot.send_message(m.chat.id,f"✅ Домашнее задание создано: {st['title']}\nID: {hid}", reply_markup=mk)
+        return
+    if st["step"]=="due_time":
+        hm=parse_time_token(t)
+        if not hm:
+            bot.reply_to(m,"Время в формате ЧЧ:ММ.")
+            return
+        due_at=combine_date_time(st["due_date"], hm)
+        open_at=st.get("open_at")
+        if open_at and due_at <= open_at:
+            bot.reply_to(m,"Дедлайн должен быть позже открытия.")
+            return
+        if due_at <= now_msk():
+            bot.reply_to(m,"Дедлайн уже прошёл. Укажите будущее.")
+            return
+        st["due_at"]=due_at
+        data=load_data()
+        hid=gen_id("H")
+        data["homeworks"][hid]={
+            "id":hid,
+            "teacher_id":uid,
+            "title":st["title"],
+            "text":st["text"],
+            "format_regex":st.get("format_regex"),
+            "open_at": st["open_at"].isoformat() if st.get("open_at") else None,
+            "due_at": due_at.isoformat(),
+            "created_at": now_iso()
+        }
+        save_data(data)
+        user_states.pop(uid,None)
+        mk=types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("📌 Назначить в класс", callback_data=f"assign_hw:{hid}"),
+               types.InlineKeyboardButton("Позже", callback_data="assign_later"))
+        bot.send_message(m.chat.id,f"✅ Домашнее задание создано: {st['title']}\nID: {hid}", reply_markup=mk)
+        return
 
 # --------------- TEACHER: CTF CREATE ---------------
 
@@ -881,6 +1288,14 @@ def cb_assign_ctf(c):
     bot.answer_callback_query(c.id)
     bot.send_message(c.message.chat.id,"Выберите класс:", reply_markup=classes_kb(uid, f"pick_class_ctf:{tid}"))
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("assign_hw:"))
+def cb_assign_hw(c):
+    uid=str(c.from_user.id); hid=c.data.split(":",1)[1]
+    if load_data()["users"].get(uid,{}).get("role")!="teacher":
+        bot.answer_callback_query(c.id,"Только учителю", show_alert=True); return
+    bot.answer_callback_query(c.id)
+    bot.send_message(c.message.chat.id,"Выберите класс:", reply_markup=classes_kb(uid, f"pick_class_hw:{hid}"))
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("pick_class_test:"))
 def cb_pick_class_test(c):
     uid=str(c.from_user.id)
@@ -906,6 +1321,32 @@ def cb_pick_class_ctf(c):
     if not t: bot.answer_callback_query(c.id,"CTF не найден", show_alert=True); return
     aid=gen_id("A")
     data["assignments"][aid]={"id":aid,"class_id":cid,"teacher_id":uid,"kind":"ctf","ref_id":tid,"title":f"CTF: {t.get('title','')}", "created_at": now_iso()}
+    save_data(data)
+    bot.answer_callback_query(c.id,"Назначено ✅")
+    bot.send_message(c.message.chat.id,"✅ Назначено.", reply_markup=kb_teacher())
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pick_class_hw:"))
+def cb_pick_class_hw(c):
+    uid=str(c.from_user.id)
+    rest=c.data.split("pick_class_hw:",1)[1]
+    hid, cid = rest.split(":",1)
+    data=load_data()
+    hw=data["homeworks"].get(hid)
+    if not hw: bot.answer_callback_query(c.id,"ДЗ не найдено", show_alert=True); return
+    aid=gen_id("A")
+    data["assignments"][aid]={
+        "id":aid,
+        "class_id":cid,
+        "teacher_id":uid,
+        "kind":"homework",
+        "ref_id":hid,
+        "title":f"ДЗ: {hw.get('title','')}",
+        "open_at": hw.get("open_at"),
+        "due_at": hw.get("due_at"),
+        "remind_hours":[24,1],
+        "remind_sent": {},
+        "created_at": now_iso()
+    }
     save_data(data)
     bot.answer_callback_query(c.id,"Назначено ✅")
     bot.send_message(c.message.chat.id,"✅ Назначено.", reply_markup=kb_teacher())
@@ -964,6 +1405,48 @@ def s_open_task(m):
         send_code_block(m.chat.id, chall)
         return
     bot.reply_to(m,"Неизвестный тип."); user_states.pop(uid,None)
+
+# --------------- STUDENT: HOMEWORK ---------------
+
+def save_homework_res(data: Dict[str,Any], aid: str, sid: str, hw_id: str, answer: str, ok: bool):
+    rid=gen_id("R")
+    data["results"][rid]={
+        "id":rid,
+        "kind":"homework",
+        "assignment_id":aid,
+        "student_id":sid,
+        "student_name":data["users"].get(sid,{}).get("username","student"),
+        "teacher_id":data["homeworks"].get(hw_id,{}).get("teacher_id"),
+        "homework_id":hw_id,
+        "answer":answer,
+        "format_ok":ok,
+        "submitted_at":now_iso()
+    }
+    save_data(data)
+
+@bot.message_handler(func=lambda m: user_states.get(str(m.from_user.id),{}).get("flow")=="submit_homework")
+def s_submit_homework(m):
+    uid=str(m.from_user.id); st=user_states[uid]; data=load_data()
+    if m.text=="❌ Отмена":
+        user_states.pop(uid,None); bot.send_message(m.chat.id,"Ок.", reply_markup=kb_student()); return
+    aid=st.get("aid"); hw_id=st.get("hw_id")
+    a=data["assignments"].get(aid)
+    if not a:
+        user_states.pop(uid,None); bot.send_message(m.chat.id,"Задание не найдено.", reply_markup=kb_student()); return
+    ok, msg = assignment_can_submit(a, now_msk())
+    if not ok:
+        user_states.pop(uid,None); bot.send_message(m.chat.id,msg, reply_markup=kb_student()); return
+    hw=data["homeworks"].get(hw_id)
+    if not hw:
+        user_states.pop(uid,None); bot.send_message(m.chat.id,"ДЗ не найдено.", reply_markup=kb_student()); return
+    ans=(m.text or "").strip()
+    fmt=hw.get("format_regex")
+    if not format_ok(ans, fmt):
+        bot.reply_to(m,"Неверный формат ответа. Попробуйте снова или отмените.")
+        return
+    save_homework_res(data, aid, uid, hw_id, ans, True)
+    user_states.pop(uid,None)
+    bot.send_message(m.chat.id,"✅ Принято.", reply_markup=kb_student()); return
 
 # --------------- STUDENT: TAKE TEST ---------------
 
